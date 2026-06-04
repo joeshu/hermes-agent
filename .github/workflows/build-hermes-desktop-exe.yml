@@ -1,0 +1,223 @@
+name: Build Hermes Desktop EXE
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每天 UTC 02:00 / 14:00 检查并编译（北京时间 10:00 / 22:00）
+    - cron: '0 2,14 * * *'
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: NousResearch/hermes-agent
+  UPSTREAM_BRANCH: main
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      has_update: ${{ steps.check.outputs.has_update }}
+      upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+      fork_sha: ${{ steps.check.outputs.fork_sha }}
+
+    steps:
+      - name: Check fork's current HEAD
+        id: fork_head
+        run: |
+          SHA=$(curl -fsSL \
+            -H "Authorization: token ${{ github.token }}" \
+            "https://api.github.com/repos/${{ github.repository }}/commits/main" \
+            | jq -r '.sha')
+          echo "fork_sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Fork HEAD: $SHA"
+
+      - name: Check upstream's latest commit
+        id: upstream_head
+        run: |
+          SHA=$(curl -fsSL \
+            -H "Authorization: token ${{ github.token }}" \
+            "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/commits/${{ env.UPSTREAM_BRANCH}}" \
+            | jq -r '.sha')
+          echo "upstream_sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Upstream HEAD: $SHA"
+
+      - name: Compare and decide
+        id: check
+        run: |
+          FORK="${{ steps.fork_head.outputs.fork_sha }}"
+          UPSTREAM="${{ steps.upstream_head.outputs.upstream_sha }}"
+          echo "fork_sha=$FORK" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM" >> "$GITHUB_OUTPUT"
+          if [ "$FORK" != "$UPSTREAM" ]; then
+            echo "has_update=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream has new commit: ${UPSTREAM:0:12} (fork is ${FORK:0:12})"
+          else
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date: ${FORK:0:12}"
+          fi
+
+  sync-and-build:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.has_update == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Add upstream remote and sync
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+          git fetch upstream ${{ env.UPSTREAM_BRANCH }}
+          git checkout -b sync-branch upstream/${{ env.UPSTREAM_BRANCH }}
+
+      - name: Restore our workflow files (keep custom workflows)
+        run: |
+          git checkout main -- .github/workflows/build-hermes-desktop-exe.yml
+
+      - name: Commit merge (upstream + custom workflow)
+        run: |
+          git config user.email "joeshu@users.noreply.github.com"
+          git config user.name "joeshu"
+          UPSTREAM_SHA=$(git rev-parse upstream/${{ env.UPSTREAM_BRANCH }})
+          git add .
+          git commit -m "sync: upstream ${UPSTREAM_SHA:0:12}" || echo "Nothing new to commit"
+
+      - name: Push to main
+        run: git push origin HEAD:main --force
+
+  build-desktop-exe:
+    needs: sync-and-build
+    if: always() && (needs.sync-and-build.result == 'success' || needs.sync-and-build.result == 'skipped')
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout synced code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.12.0'
+          cache: npm
+
+      - name: Install npm workspace deps
+        run: npm ci
+
+      - name: Build Hermes desktop app
+        shell: pwsh
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          WIN_CSC_LINK: ''
+          WIN_CSC_KEY_PASSWORD: ''
+        run: |
+          Write-Output "Starting desktop build (npm run pack)..."
+          Push-Location apps/desktop
+          npm run pack
+          Pop-Location
+          Write-Output "Desktop build complete"
+
+      - name: Locate Hermes.exe
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "apps/desktop/release/win-unpacked/Hermes.exe",
+            "apps/desktop/release/win-arm64-unpacked/Hermes.exe"
+          )
+          $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $found) {
+            throw "Hermes.exe not found under apps/desktop/release/*-unpacked/"
+          }
+          Write-Output "Found: $found"
+          Add-Content -Path $env:GITHUB_ENV -Value "HERMES_EXE=$found"
+
+      - name: Zip Hermes.exe for upload
+        shell: pwsh
+        run: |
+          $exe = "${{ env.HERMES_EXE }}"
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+          $zipPath = "$env:RUNNER_TEMP\Hermes-${shortSha}.zip"
+          Compress-Archive -Path $exe -DestinationPath $zipPath -Force
+          Add-Content -Path $env:GITHUB_ENV -Value "HERMES_ZIP=$zipPath"
+          Add-Content -Path $env:GITHUB_ENV -Value "SHORT_SHA=$shortSha"
+          Write-Output "Zipped to: $zipPath"
+
+      - name: Upload Hermes.exe as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hermes.exe-${{ github.sha }}
+          path: ${{ env.HERMES_EXE }}
+          if-no-files-found: error
+
+      - name: Get version info
+        id: version
+        shell: bash
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          VERSION=$(node -e "console.log(require('./apps/desktop/package.json').version)")
+          echo "desktop_version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "Desktop version: $VERSION"
+          echo "Git SHA: $SHORT_SHA"
+
+      - name: Write release notes file
+        shell: bash
+        run: |
+          cat > /tmp/release-notes.md <<- EONOTES
+          ## Hermes Desktop v${{ steps.version.outputs.desktop_version }}
+
+          **构建信息：**
+          - Git SHA: \`${{ steps.version.outputs.short_sha }}\`
+          - 上游仓库: ${{ env.UPSTREAM_REPO }}
+          - 构建时间: $(date -u +'%Y-%m-%d %H:%M UTC')
+
+          **来源：** NousResearch/hermes-agent@\`${{ steps.version.outputs.short_sha }}\`
+
+          > 此 Release 由 GitHub Actions 自动编译发布。
+          > 文件为解压即用的 Hermes.exe（Windows 桌面版 Electron 应用）。
+          EONOTES
+
+      - name: Create or update Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHORT_SHA="${{ steps.version.outputs.short_sha }}"
+          DESKTOP_VER="${{ steps.version.outputs.desktop_version }}"
+          TAG_NAME="desktop-v${DESKTOP_VER}"
+          RELEASE_NAME="Hermes Desktop v${DESKTOP_VER} (${SHORT_SHA})"
+          ZIP_PATH="${{ env.HERMES_ZIP }}"
+
+          echo "Tag: $TAG_NAME"
+          echo "Release: $RELEASE_NAME"
+
+          EXISTING=$(gh release view "$TAG_NAME" --json id --jq '.id' 2>/dev/null || echo "")
+
+          if [ -n "$EXISTING" ]; then
+            echo "Release $TAG_NAME already exists, updating assets..."
+            gh release delete-asset "$TAG_NAME" "Hermes-${SHORT_SHA}.zip" --yes 2>/dev/null || true
+            gh release upload "$TAG_NAME" "$ZIP_PATH" --clobber
+          else
+            echo "Creating new release $TAG_NAME..."
+            gh release create "$TAG_NAME" \
+              --title "$RELEASE_NAME" \
+              --notes-file /tmp/release-notes.md \
+              "$ZIP_PATH"
+          fi
+
+          echo "tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "Release URL: https://github.com/${{ github.repository }}/releases/tag/$TAG_NAME"
